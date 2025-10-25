@@ -46,7 +46,7 @@ A production-ready FastAPI template with role-based access control, 2FA, email n
 1. **Clone and setup virtual environment:**
 ```bash
 git clone <repository-url>
-cd carbelsad
+cd fastapi-template
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 ```
@@ -113,7 +113,7 @@ python main.py
 ## Project Structure
 
 ```
-carbelsad/
+fastapi-template/
 ├── main.py                              # Application entry point
 ├── setup_secret_key.py                  # SECRET_KEY generator
 ├── setup_first_superadmin.py            # Superadmin creation script
