@@ -45,7 +45,7 @@ A production-ready FastAPI template with role-based access control, 2FA, email n
 
 1. **Clone and setup virtual environment:**
 ```bash
-git clone <repository-url>
+git clone https://github.com/b9llach/fastapi-template.git
 cd fastapi-template
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
