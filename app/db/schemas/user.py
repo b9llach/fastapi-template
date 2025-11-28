@@ -59,6 +59,9 @@ class UserResponse(UserBase):
     two_fa_enabled: bool
     email_verified: bool
     phone_verified: bool
+    oauth_provider: Optional[str] = None
+    stripe_customer_id: Optional[str] = None
+    stripe_connect_id: Optional[str] = None
     last_login_at: Optional[datetime] = None
     created_at: datetime
     updated_at: Optional[datetime] = None

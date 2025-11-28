@@ -131,6 +131,114 @@ class CRUDUser(CRUDBase[User, UserCreate, UserUpdate]):
         )
         return list(result.scalars().all())
 
+    async def get_by_oauth(
+        self,
+        db: AsyncSession,
+        oauth_provider: str,
+        oauth_id: str
+    ) -> Optional[User]:
+        """
+        Get user by OAuth provider and ID
+        """
+        result = await db.execute(
+            select(User).where(
+                User.oauth_provider == oauth_provider,
+                User.oauth_id == oauth_id
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def create_oauth_user(
+        self,
+        db: AsyncSession,
+        email: str,
+        username: str,
+        oauth_provider: str,
+        oauth_id: str,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+        email_verified: bool = False
+    ) -> User:
+        """
+        Create a new user from OAuth authentication
+        """
+        # Check if username already exists, make it unique if needed
+        existing_user = await self.get_by_username(db, username)
+        if existing_user:
+            # Append random suffix to make username unique
+            import random
+            username = f"{username}{random.randint(1000, 9999)}"
+
+        db_obj = User(
+            username=username,
+            email=email,
+            hashed_password=None,  # OAuth users don't have passwords
+            first_name=first_name,
+            last_name=last_name,
+            avatar_url=avatar_url,
+            oauth_provider=oauth_provider,
+            oauth_id=oauth_id,
+            email_verified=email_verified,
+            role=UserRole.USER
+        )
+        db.add(db_obj)
+        await db.flush()
+        await db.refresh(db_obj)
+        return db_obj
+
+    async def get_or_create_oauth_user(
+        self,
+        db: AsyncSession,
+        email: str,
+        username: str,
+        oauth_provider: str,
+        oauth_id: str,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+        email_verified: bool = False
+    ) -> tuple[User, bool]:
+        """
+        Get existing OAuth user or create new one
+
+        Returns:
+            Tuple of (user, created) where created is True if user was just created
+        """
+        # First try to get by OAuth ID
+        user = await self.get_by_oauth(db, oauth_provider, oauth_id)
+        if user:
+            return user, False
+
+        # Check if user exists with this email
+        user = await self.get_by_email(db, email)
+        if user:
+            # Link OAuth to existing account
+            user.oauth_provider = oauth_provider
+            user.oauth_id = oauth_id
+            if not user.avatar_url and avatar_url:
+                user.avatar_url = avatar_url
+            if not user.email_verified:
+                user.email_verified = email_verified
+            db.add(user)
+            await db.flush()
+            await db.refresh(user)
+            return user, False
+
+        # Create new user
+        user = await self.create_oauth_user(
+            db=db,
+            email=email,
+            username=username,
+            oauth_provider=oauth_provider,
+            oauth_id=oauth_id,
+            first_name=first_name,
+            last_name=last_name,
+            avatar_url=avatar_url,
+            email_verified=email_verified
+        )
+        return user, True
+
 
 # Create a singleton instance
 user_crud = CRUDUser(User)

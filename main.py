@@ -3,12 +3,13 @@ FastAPI Application Entry Point
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from contextlib import asynccontextmanager
 
 from app.core.config import settings
 from app.core.async_database import init_db, close_db
 from app.core.cache import init_cache, close_cache
-from app.api.routers import health, users, auth
+from app.api.routers import health, users, auth, stripe
 from app.middleware.rate_limiting import RateLimitMiddleware
 from app.websockets import router as websocket_router
 
@@ -21,6 +22,13 @@ async def lifespan(app: FastAPI):
     # Startup
     await init_db()
     await init_cache()
+
+    # Configure Google OAuth if enabled
+    if settings.GOOGLE_OAUTH_ENABLED:
+        from app.core.oauth import configure_google_oauth
+        configure_google_oauth()
+        print("Google OAuth configured")
+
     print("Application startup complete")
 
     yield
@@ -51,6 +59,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add session middleware (required for OAuth)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.SECRET_KEY
+)
+
 # Add rate limiting middleware
 app.add_middleware(RateLimitMiddleware)
 
@@ -58,6 +72,7 @@ app.add_middleware(RateLimitMiddleware)
 app.include_router(health.router, prefix=f"{settings.API_PREFIX}/health", tags=["Health"])
 app.include_router(auth.router, prefix=f"{settings.API_PREFIX}/auth", tags=["Authentication"])
 app.include_router(users.router, prefix=f"{settings.API_PREFIX}/users", tags=["Users"])
+app.include_router(stripe.router, prefix=f"{settings.API_PREFIX}/stripe", tags=["Stripe"])
 app.include_router(websocket_router.router, tags=["WebSocket"])
 
 

@@ -8,6 +8,8 @@ A production-ready FastAPI template with role-based access control, 2FA, email n
 - **Async Everything**: Fully async FastAPI with PostgreSQL (asyncpg) and Redis
 - **Role-Based Access Control**: User, Admin, and Superadmin roles with granular permissions
 - **JWT Authentication**: Secure token-based authentication with refresh tokens
+- **Google OAuth Login**: Native Google Sign-In integration (optional)
+- **Stripe Integration**: Full payment processing, subscriptions, and Connect (optional)
 - **Two-Factor Authentication**: Per-user 2FA via email with customizable settings
 - **Rich User Profiles**: Phone, avatar, bio, timezone, language preferences, and activity tracking
 - **Email Service**: Full SMTP integration with HTML templates
@@ -20,6 +22,7 @@ A production-ready FastAPI template with role-based access control, 2FA, email n
 ### Security Features
 - Bcrypt password hashing
 - JWT tokens with configurable expiration
+- OAuth 2.0 authentication (Google)
 - API key support
 - CORS configuration
 - SQL injection protection
@@ -92,6 +95,18 @@ EMAILS_FROM_EMAIL=noreply@yourdomain.com
 
 # CORS
 ALLOWED_ORIGINS=["http://localhost:3000","http://localhost:8000"]
+
+# Google OAuth (optional)
+GOOGLE_OAUTH_ENABLED=True
+GOOGLE_CLIENT_ID=your-google-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+GOOGLE_REDIRECT_URI=http://localhost:8000/api/v1/auth/google/callback
+
+# Stripe (optional)
+STRIPE_ENABLED=True
+STRIPE_SECRET_KEY=sk_test_your-secret-key
+STRIPE_PUBLISHABLE_KEY=pk_test_your-publishable-key
+STRIPE_WEBHOOK_SECRET=whsec_your-webhook-secret
 ```
 
 5. **Create first superadmin:**
@@ -178,6 +193,8 @@ carbelsad/
 |--------|----------|-------------|---------------|
 | POST | `/register` | Register new user | No |
 | POST | `/login` | Login (username or email) | No |
+| GET | `/google/login` | Initiate Google OAuth login | No |
+| GET | `/google/callback` | Google OAuth callback (returns JWT) | No |
 | POST | `/verify-2fa` | Verify 2FA code | No |
 | POST | `/enable-2fa` | Enable 2FA for current user | Yes |
 | POST | `/disable-2fa` | Disable 2FA | Yes |
@@ -200,6 +217,22 @@ carbelsad/
 | GET | `/` | Basic health check |
 | GET | `/db` | Database connectivity |
 | GET | `/cache` | Redis cache connectivity |
+
+### Stripe (`/api/v1/stripe`)
+| Method | Endpoint | Description | Auth Required |
+|--------|----------|-------------|---------------|
+| POST | `/customers` | Create Stripe customer | Yes |
+| GET | `/customers/me` | Get current user's customer info | Yes |
+| POST | `/payment-intents` | Create payment intent | Yes |
+| POST | `/payment-methods/attach` | Attach payment method to customer | Yes |
+| GET | `/payment-methods` | List payment methods | Yes |
+| POST | `/subscriptions` | Create subscription | Yes |
+| POST | `/subscriptions/{id}/cancel` | Cancel subscription | Yes |
+| POST | `/connect/accounts` | Create Connect account | Yes |
+| POST | `/connect/account-links` | Create Connect onboarding link | Yes |
+| GET | `/connect/accounts/me` | Get Connect account info | Yes |
+| POST | `/webhooks` | Handle Stripe webhooks | No |
+| GET | `/config` | Get publishable key | Yes |
 
 ### WebSockets
 | Endpoint | Description |
@@ -253,6 +286,27 @@ curl -X POST "http://localhost:8000/api/v1/auth/login" \
     "username_or_email": "john@example.com",
     "password": "securepass123"
   }'
+```
+
+### Google OAuth Login
+```bash
+# In a browser, visit:
+http://localhost:8000/api/v1/auth/google/login
+
+# This will:
+# 1. Redirect to Google's OAuth consent screen
+# 2. User authorizes the app
+# 3. Redirect to callback endpoint
+# 4. Return JWT tokens (access_token, refresh_token)
+```
+
+Or use in a frontend:
+```javascript
+// Redirect user to Google login
+window.location.href = 'http://localhost:8000/api/v1/auth/google/login';
+
+// Handle the callback (tokens will be returned)
+// You can then store the access_token for API requests
 ```
 
 ### Using JWT Token
@@ -391,6 +445,120 @@ curl -X POST "http://localhost:8000/api/v1/auth/test-2fa" \
 ```
 
 See [EMAIL_SETUP.md](EMAIL_SETUP.md) for other providers (Outlook, SendGrid, AWS SES).
+
+## Google OAuth Configuration
+
+To enable Google OAuth login:
+
+### 1. Create Google OAuth Credentials
+1. Go to [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
+2. Create a new project (or select existing)
+3. Enable Google+ API
+4. Go to "Credentials" → "Create Credentials" → "OAuth 2.0 Client ID"
+5. Configure OAuth consent screen if prompted
+6. Choose "Web application" as application type
+7. Add authorized redirect URIs:
+   - `http://localhost:8000/api/v1/auth/google/callback` (development)
+   - `https://yourdomain.com/api/v1/auth/google/callback` (production)
+8. Copy your Client ID and Client Secret
+
+### 2. Configure Environment Variables
+```env
+GOOGLE_OAUTH_ENABLED=True
+GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=your-client-secret
+GOOGLE_REDIRECT_URI=http://localhost:8000/api/v1/auth/google/callback
+```
+
+### 3. How It Works
+- OAuth users don't need passwords (stored as `NULL` in database)
+- If user registers with password first, then logs in with Google using same email, OAuth is linked to existing account
+- Users get their profile picture from Google automatically (`avatar_url`)
+- Email is automatically verified for Google OAuth users
+
+## Stripe Configuration
+
+To enable Stripe payments and subscriptions:
+
+### 1. Create Stripe Account
+1. Sign up at [Stripe Dashboard](https://dashboard.stripe.com/register)
+2. Complete account setup
+3. Get API keys from [API Keys page](https://dashboard.stripe.com/apikeys)
+
+### 2. Configure Environment Variables
+```env
+STRIPE_ENABLED=True
+STRIPE_SECRET_KEY=sk_test_your-secret-key
+STRIPE_PUBLISHABLE_KEY=pk_test_your-publishable-key
+STRIPE_WEBHOOK_SECRET=whsec_your-webhook-secret
+STRIPE_CURRENCY=usd
+```
+
+### 3. Set Up Webhooks
+1. Go to [Webhooks Dashboard](https://dashboard.stripe.com/webhooks)
+2. Add endpoint: `https://yourdomain.com/api/v1/stripe/webhooks`
+3. Select events to listen for:
+   - `payment_intent.succeeded`
+   - `payment_intent.payment_failed`
+   - `customer.subscription.created`
+   - `customer.subscription.updated`
+   - `customer.subscription.deleted`
+   - `account.updated` (for Connect)
+4. Copy webhook signing secret to `STRIPE_WEBHOOK_SECRET`
+
+### 4. Features Available
+
+**Payments:**
+- Create customers automatically for users
+- Process one-time payments via Payment Intents
+- Save and manage payment methods
+- Support for multiple currencies
+
+**Subscriptions:**
+- Create and manage recurring subscriptions
+- Cancel subscriptions (immediate or at period end)
+- Automatic invoice creation
+
+**Stripe Connect:**
+- Onboard sellers/service providers
+- Create Connect accounts (Express, Standard, Custom)
+- Process platform payments with splits
+- Transfer funds to connected accounts
+
+### 5. Usage Examples
+
+**Create a Payment Intent:**
+```bash
+curl -X POST "http://localhost:8000/api/v1/stripe/payment-intents" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "amount": 2000,
+    "currency": "usd",
+    "description": "Product purchase"
+  }'
+```
+
+**Create a Subscription:**
+```bash
+curl -X POST "http://localhost:8000/api/v1/stripe/subscriptions" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "price_id": "price_xxxxxxxxxxxxx"
+  }'
+```
+
+**Create Connect Account:**
+```bash
+curl -X POST "http://localhost:8000/api/v1/stripe/connect/accounts" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "country": "US",
+    "account_type": "express"
+  }'
+```
 
 ## Database Migrations
 
@@ -536,7 +704,8 @@ RATE_LIMIT_ENABLED=False
 - **Database**: PostgreSQL with asyncpg
 - **ORM**: SQLAlchemy 2.0 (async)
 - **Cache**: Redis
-- **Authentication**: JWT (python-jose)
+- **Authentication**: JWT (python-jose), OAuth 2.0 (authlib)
+- **Payments**: Stripe
 - **Password Hashing**: bcrypt
 - **Validation**: Pydantic v2
 - **Email**: aiosmtplib

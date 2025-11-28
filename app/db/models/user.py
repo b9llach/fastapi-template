@@ -17,9 +17,17 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String(50), unique=True, index=True, nullable=False)
     email = Column(String(100), unique=True, index=True, nullable=False)
-    hashed_password = Column(String(255), nullable=False)
+    hashed_password = Column(String(255), nullable=True)  # Nullable for OAuth users
     first_name = Column(String(50), nullable=True)
     last_name = Column(String(50), nullable=True)
+
+    # OAuth fields
+    oauth_provider = Column(String(50), nullable=True)  # 'google', 'github', etc.
+    oauth_id = Column(String(255), nullable=True)  # Provider's user ID
+
+    # Stripe fields
+    stripe_customer_id = Column(String(255), nullable=True)  # Stripe customer ID
+    stripe_connect_id = Column(String(255), nullable=True)  # Stripe Connect account ID
 
     # Contact & Profile
     phone_number = Column(String(20), nullable=True)

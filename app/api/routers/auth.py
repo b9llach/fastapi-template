@@ -1,7 +1,8 @@
 """
 Authentication endpoints including 2FA
 """
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status, Body, Request
+from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.async_database import get_db
@@ -18,6 +19,7 @@ from app.db.schemas.user import (
 from app.services.user_service import user_service
 from app.services.email_service import email_service
 from app.db.utils.user_crud import user_crud
+from app.core.config import settings
 
 router = APIRouter()
 
@@ -252,4 +254,106 @@ async def test_2fa(
     return {
         "message": "Test 2FA code sent to your email",
         "email": current_user.email
+    }
+
+
+# Google OAuth endpoints
+@router.get("/google/login")
+async def google_login(request: Request):
+    """
+    Initiate Google OAuth login flow
+
+    Redirects user to Google's OAuth consent screen
+    """
+    if not settings.GOOGLE_OAUTH_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google OAuth is not enabled. Set GOOGLE_OAUTH_ENABLED=True in environment."
+        )
+
+    from app.core.oauth import oauth
+
+    redirect_uri = request.url_for('google_callback')
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+
+@router.get("/google/callback", response_model=Token)
+async def google_callback(
+    request: Request,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Handle Google OAuth callback
+
+    After user authorizes, Google redirects here with auth code.
+    This endpoint exchanges the code for user info and creates/logs in the user.
+    """
+    if not settings.GOOGLE_OAUTH_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google OAuth is not enabled"
+        )
+
+    from app.core.oauth import oauth, validate_google_user_info
+    from app.core.security import create_access_token, create_refresh_token
+    from datetime import datetime, timezone
+
+    try:
+        # Exchange authorization code for access token
+        token = await oauth.google.authorize_access_token(request)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to authorize with Google: {str(e)}"
+        )
+
+    # Get user info from Google
+    user_info = token.get('userinfo')
+    if not user_info:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Failed to get user info from Google"
+        )
+
+    # Validate and extract user data
+    validated_data = validate_google_user_info(user_info)
+
+    # Get or create user
+    user, created = await user_crud.get_or_create_oauth_user(
+        db=db,
+        email=validated_data['email'],
+        username=validated_data['username'],
+        oauth_provider=validated_data['oauth_provider'],
+        oauth_id=validated_data['oauth_id'],
+        first_name=validated_data.get('first_name'),
+        last_name=validated_data.get('last_name'),
+        avatar_url=validated_data.get('avatar_url'),
+        email_verified=validated_data.get('email_verified', False)
+    )
+
+    # Update last login
+    user.last_login_at = datetime.now(timezone.utc)
+    db.add(user)
+    await db.commit()
+
+    # Generate JWT tokens
+    access_token = create_access_token(
+        data={
+            "sub": str(user.id),
+            "username": user.username,
+            "role": user.role.value
+        }
+    )
+    refresh_token = create_refresh_token(
+        data={
+            "sub": str(user.id),
+            "username": user.username,
+            "role": user.role.value
+        }
+    )
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
     }

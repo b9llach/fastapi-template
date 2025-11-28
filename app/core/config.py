@@ -56,6 +56,19 @@ class Settings(BaseSettings):
     # 2FA Settings
     TWO_FA_CODE_EXPIRE_MINUTES: int = 10
 
+    # Google OAuth Settings
+    GOOGLE_CLIENT_ID: str = ""
+    GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/google/callback"
+    GOOGLE_OAUTH_ENABLED: bool = False
+
+    # Stripe Settings
+    STRIPE_SECRET_KEY: str = ""
+    STRIPE_PUBLISHABLE_KEY: str = ""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    STRIPE_ENABLED: bool = False
+    STRIPE_CURRENCY: str = "usd"
+
     class Config:
         env_file = ".env"
         case_sensitive = True
