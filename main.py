@@ -9,8 +9,10 @@ from contextlib import asynccontextmanager
 from app.core.config import settings
 from app.core.async_database import init_db, close_db
 from app.core.cache import init_cache, close_cache
-from app.api.routers import health, users, auth, stripe
+from app.core.sentry import init_sentry
+from app.api.routers import health, users, auth, stripe, files, notifications
 from app.middleware.rate_limiting import RateLimitMiddleware
+from app.middleware.correlation_id import CorrelationIDMiddleware
 from app.websockets import router as websocket_router
 
 
@@ -22,6 +24,9 @@ async def lifespan(app: FastAPI):
     # Startup
     await init_db()
     await init_cache()
+
+    # Initialize Sentry
+    init_sentry()
 
     # Configure Google OAuth if enabled
     if settings.GOOGLE_OAUTH_ENABLED:
@@ -59,6 +64,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add correlation ID middleware (for request tracing)
+app.add_middleware(CorrelationIDMiddleware)
+
 # Add session middleware (required for OAuth)
 app.add_middleware(
     SessionMiddleware,
@@ -73,6 +81,8 @@ app.include_router(health.router, prefix=f"{settings.API_PREFIX}/health", tags=[
 app.include_router(auth.router, prefix=f"{settings.API_PREFIX}/auth", tags=["Authentication"])
 app.include_router(users.router, prefix=f"{settings.API_PREFIX}/users", tags=["Users"])
 app.include_router(stripe.router, prefix=f"{settings.API_PREFIX}/stripe", tags=["Stripe"])
+app.include_router(files.router, prefix=f"{settings.API_PREFIX}/files", tags=["Files"])
+app.include_router(notifications.router, prefix=f"{settings.API_PREFIX}/notifications", tags=["Notifications"])
 app.include_router(websocket_router.router, tags=["WebSocket"])
 
 

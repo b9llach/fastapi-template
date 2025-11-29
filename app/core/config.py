@@ -69,6 +69,36 @@ class Settings(BaseSettings):
     STRIPE_ENABLED: bool = False
     STRIPE_CURRENCY: str = "usd"
 
+    # Celery Settings
+    CELERY_BROKER_URL: str = "redis://localhost:6379/1"
+    CELERY_RESULT_BACKEND: str = "redis://localhost:6379/1"
+
+    # File Upload Settings
+    UPLOAD_DIR: str = "uploads"
+    MAX_UPLOAD_SIZE: int = 10 * 1024 * 1024  # 10MB
+    ALLOWED_EXTENSIONS: List[str] = ["jpg", "jpeg", "png", "gif", "pdf", "doc", "docx"]
+
+    # S3 Settings (optional)
+    USE_S3: bool = False
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_S3_BUCKET: str = ""
+    AWS_REGION: str = "us-east-1"
+
+    # Sentry Settings
+    SENTRY_DSN: str = ""
+    SENTRY_ENABLED: bool = False
+    SENTRY_ENVIRONMENT: str = "development"
+    SENTRY_TRACES_SAMPLE_RATE: float = 1.0
+
+    # Firebase Settings
+    FIREBASE_ENABLED: bool = False
+    FIREBASE_CREDENTIALS_PATH: str = ""
+    FIREBASE_PROJECT_ID: str = ""
+
+    # Audit Log Settings
+    AUDIT_LOG_ENABLED: bool = True
+
     class Config:
         env_file = ".env"
         case_sensitive = True

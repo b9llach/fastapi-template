@@ -6,6 +6,13 @@ asyncpg==0.30.0
 authlib==1.4.0
 bcrypt==5.0.0
 black==25.9.0
+boto3==1.35.76
+celery==5.4.0
+firebase-admin==6.6.0
+kombu==5.4.2
+pillow==11.0.0
+python-magic==0.4.27
+sentry-sdk==2.19.2
 certifi==2025.10.5
 cffi==2.0.0
 click==8.3.0
