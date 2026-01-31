@@ -47,8 +47,10 @@ pydantic-settings==2.11.0
 pydantic_core==2.41.4
 pyflakes==3.4.0
 Pygments==2.19.2
+pyotp==2.9.0
 pytest==8.4.2
 pytest-asyncio==1.2.0
+qrcode==8.0
 python-dotenv==1.1.1
 python-jose==3.5.0
 python-multipart==0.0.20

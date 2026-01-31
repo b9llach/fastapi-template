@@ -16,7 +16,10 @@ from app.db.schemas.user import (
     Token,
     UserSettings,
     TwoFactorRequest,
-    RefreshTokenRequest
+    RefreshTokenRequest,
+    TOTPSetupResponse,
+    TOTPVerifyRequest,
+    TOTPDisableRequest
 )
 from app.services.user_service import user_service
 from app.services.email_service import email_service
@@ -84,8 +87,24 @@ async def login(
             detail="Inactive user"
         )
 
-    # Check if user has 2FA enabled
-    if user.two_fa_enabled:
+    # Check if user has TOTP enabled (authenticator app - takes priority)
+    if user.totp_enabled:
+        # Generate a temporary session token for TOTP verification
+        session_token = secrets.token_urlsafe(32)
+        await cache_set(
+            f"totp_login:{session_token}",
+            str(user.id),
+            ttl=300  # 5 minutes to enter TOTP code
+        )
+
+        return {
+            "message": "Please enter the code from your authenticator app",
+            "requires_2fa": True,
+            "two_fa_type": "totp",
+            "session_token": session_token
+        }
+    # Check if user has email 2FA enabled
+    elif user.two_fa_enabled:
         # Generate and send 2FA code
         code = await email_service.generate_2fa_code(user.id)
         await email_service.send_2fa_email(
@@ -105,6 +124,7 @@ async def login(
         return {
             "message": "2FA code sent to your email",
             "requires_2fa": True,
+            "two_fa_type": "email",
             "session_token": session_token  # Use opaque token instead of user_id
         }
     else:
@@ -818,4 +838,270 @@ async def revoke_all_sessions(
     return {
         "message": f"Revoked {revoked_count} session(s)",
         "revoked_count": revoked_count
+    }
+
+
+# TOTP (Authenticator App) endpoints
+@router.post("/totp/setup", response_model=TOTPSetupResponse)
+async def setup_totp(
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Begin TOTP setup - generates secret and QR code for authenticator app
+
+    The user must scan the QR code with their authenticator app (Google Authenticator,
+    Microsoft Authenticator, Authy, etc.) and then verify with a code to complete setup.
+
+    NOTE: TOTP is NOT enabled until the user verifies with /totp/verify-setup
+    """
+    from app.services.totp_service import totp_service
+
+    if current_user.totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="TOTP is already enabled. Disable it first to set up a new authenticator."
+        )
+
+    # Check if email is verified
+    if not current_user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please verify your email before enabling TOTP"
+        )
+
+    # Generate new TOTP secret and QR code
+    secret, qr_code, provisioning_uri = totp_service.setup_totp(
+        email=current_user.email,
+        username=current_user.username
+    )
+
+    # Store the secret temporarily in cache until verified
+    # (Don't save to DB until user confirms it works)
+    await cache_set(
+        f"totp_setup:{current_user.id}",
+        secret,
+        ttl=600  # 10 minutes to complete setup
+    )
+
+    return TOTPSetupResponse(
+        secret=secret,
+        qr_code=qr_code,
+        provisioning_uri=provisioning_uri,
+        message="Scan the QR code with your authenticator app, then verify with a code"
+    )
+
+
+@router.post("/totp/verify-setup")
+async def verify_totp_setup(
+    request: TOTPVerifyRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_endpoint(max_requests=10, window_seconds=60))
+):
+    """
+    Complete TOTP setup by verifying a code from the authenticator app
+
+    This confirms the user has successfully added the secret to their authenticator
+    and enables TOTP for their account.
+    Rate limited: 10 requests per minute per IP
+    """
+    from app.services.totp_service import totp_service
+
+    if current_user.totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="TOTP is already enabled"
+        )
+
+    # Get the pending secret from cache
+    secret = await cache_get(f"totp_setup:{current_user.id}")
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No TOTP setup in progress. Please start setup first with /totp/setup"
+        )
+
+    # Verify the code
+    if not totp_service.verify_code(secret, request.code):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid code. Please try again with a fresh code from your authenticator app."
+        )
+
+    # Code verified - save secret and enable TOTP
+    current_user.totp_secret = secret
+    current_user.totp_enabled = True
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+
+    # Clean up the setup cache
+    await cache_delete(f"totp_setup:{current_user.id}")
+
+    # Send confirmation email
+    await email_service.send_email(
+        to=[current_user.email],
+        subject="Authenticator App Enabled",
+        body="Two-factor authentication via authenticator app has been enabled for your account.",
+        html="<p>Two-factor authentication via authenticator app has been successfully enabled for your account.</p>"
+    )
+
+    return {
+        "message": "TOTP has been enabled successfully",
+        "totp_enabled": True
+    }
+
+
+@router.post("/totp/disable")
+async def disable_totp(
+    request: TOTPDisableRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Disable TOTP authenticator
+
+    Requires either password OR current TOTP code for security.
+    OAuth-only users must provide TOTP code.
+    """
+    from app.services.totp_service import totp_service
+    from app.core.security import verify_password
+
+    if not current_user.totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="TOTP is not enabled"
+        )
+
+    # Validate that at least one verification method is provided
+    if not request.password and not request.totp_code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either password or TOTP code is required"
+        )
+
+    verified = False
+
+    # Try password verification first (if user has password and provided one)
+    if request.password and current_user.hashed_password:
+        if verify_password(request.password, current_user.hashed_password):
+            verified = True
+
+    # Try TOTP verification
+    if not verified and request.totp_code:
+        if totp_service.verify_code(current_user.totp_secret, request.totp_code):
+            verified = True
+
+    if not verified:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid password or TOTP code"
+        )
+
+    # Disable TOTP
+    current_user.totp_secret = None
+    current_user.totp_enabled = False
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+
+    # Send notification email
+    await email_service.send_email(
+        to=[current_user.email],
+        subject="Authenticator App Disabled",
+        body="Two-factor authentication via authenticator app has been disabled for your account. If this wasn't you, please secure your account immediately.",
+        html="<p>Two-factor authentication via authenticator app has been disabled for your account.</p><p>If this wasn't you, please secure your account immediately.</p>"
+    )
+
+    return {
+        "message": "TOTP has been disabled successfully",
+        "totp_enabled": False
+    }
+
+
+@router.post("/totp/verify", response_model=Token)
+async def verify_totp_login(
+    request: TwoFactorRequest,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_endpoint(max_requests=10, window_seconds=60))
+):
+    """
+    Verify TOTP code during login and complete authentication
+
+    This is used when a user with TOTP enabled logs in.
+    Rate limited: 10 requests per minute per IP
+    """
+    from app.services.totp_service import totp_service
+    from app.core.security import create_access_token, create_refresh_token
+    from datetime import datetime, timezone
+
+    # Get user_id from session token
+    user_id_str = await cache_get(f"totp_login:{request.session_token}")
+    if not user_id_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session. Please login again."
+        )
+
+    user_id = int(user_id_str)
+
+    # Get user
+    user = await user_crud.get(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
+
+    # Verify TOTP code
+    if not totp_service.verify_code(user.totp_secret, request.code):
+        # Track failed attempts for brute-force protection
+        fail_key = f"totp_fail:{user_id}"
+        fail_count = await cache_get(fail_key)
+        fail_count = int(fail_count) + 1 if fail_count else 1
+        await cache_set(fail_key, str(fail_count), ttl=300)  # 5 minute window
+
+        if fail_count >= 5:
+            # Delete the session to force re-login
+            await cache_delete(f"totp_login:{request.session_token}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Too many failed attempts. Please login again."
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid TOTP code"
+        )
+
+    # Clear failed attempts and session token
+    await cache_delete(f"totp_fail:{user_id}")
+    await cache_delete(f"totp_login:{request.session_token}")
+
+    # Update last login timestamp
+    user.last_login_at = datetime.now(timezone.utc)
+    db.add(user)
+    await db.commit()
+
+    # Generate tokens
+    access_token = create_access_token(
+        data={
+            "sub": str(user.id),
+            "username": user.username,
+            "role": user.role.value
+        }
+    )
+    refresh_token = create_refresh_token(
+        data={
+            "sub": str(user.id),
+            "username": user.username,
+            "role": user.role.value
+        }
+    )
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
     }

@@ -42,8 +42,12 @@ class User(Base):
     # Status & Security
     is_active = Column(Boolean, default=True)
     role = Column(Enum(UserRole), default=UserRole.USER, nullable=False)
-    two_fa_enabled = Column(Boolean, default=False)
     email_verified = Column(Boolean, default=False)
+
+    # Two-Factor Authentication
+    two_fa_enabled = Column(Boolean, default=False)  # Email-based 2FA
+    totp_secret = Column(String(32), nullable=True)  # TOTP secret for authenticator apps
+    totp_enabled = Column(Boolean, default=False)    # Whether TOTP is active
 
     # Timestamps
     last_login_at = Column(DateTime(timezone=True), nullable=True)

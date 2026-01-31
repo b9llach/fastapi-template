@@ -56,7 +56,8 @@ class UserResponse(UserBase):
     id: int
     is_active: bool
     role: UserRole
-    two_fa_enabled: bool
+    two_fa_enabled: bool      # Email-based 2FA
+    totp_enabled: bool = False  # TOTP authenticator app
     email_verified: bool
     phone_verified: bool
     oauth_provider: Optional[str] = None
@@ -115,3 +116,29 @@ class TokenData(BaseModel):
     Schema for token data
     """
     username: Optional[str] = None
+
+
+# TOTP (Authenticator App) Schemas
+class TOTPSetupResponse(BaseModel):
+    """
+    Response for TOTP setup - contains QR code and secret
+    """
+    secret: str = Field(..., description="Base32-encoded secret (for manual entry)")
+    qr_code: str = Field(..., description="Base64-encoded QR code image (data URI)")
+    provisioning_uri: str = Field(..., description="otpauth:// URI for manual entry")
+    message: str = "Scan the QR code with your authenticator app, then verify with a code"
+
+
+class TOTPVerifyRequest(BaseModel):
+    """
+    Request to verify TOTP code during setup or login
+    """
+    code: str = Field(..., min_length=6, max_length=6, description="6-digit code from authenticator app")
+
+
+class TOTPDisableRequest(BaseModel):
+    """
+    Request to disable TOTP - requires password or TOTP code
+    """
+    password: Optional[str] = Field(None, description="Password (for users with password)")
+    totp_code: Optional[str] = Field(None, min_length=6, max_length=6, description="Current TOTP code")
