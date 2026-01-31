@@ -10,9 +10,11 @@ from app.core.config import settings
 from app.core.async_database import init_db, close_db
 from app.core.cache import init_cache, close_cache
 from app.core.sentry import init_sentry
+from app.core.exceptions import setup_exception_handlers
 from app.api.routers import health, users, auth, stripe, files, notifications
 from app.middleware.rate_limiting import RateLimitMiddleware
 from app.middleware.correlation_id import CorrelationIDMiddleware
+from app.middleware.security_headers import SecurityHeadersMiddleware
 from app.websockets import router as websocket_router
 
 
@@ -21,6 +23,13 @@ async def lifespan(app: FastAPI):
     """
     Lifespan context manager for startup and shutdown events
     """
+    # Setup logging first
+    from app.utils.logger import setup_logging
+    setup_logging(
+        log_level="DEBUG" if settings.DEBUG else "INFO",
+        json_logs=not settings.DEBUG
+    )
+
     # Startup
     await init_db()
     await init_cache()
@@ -55,6 +64,9 @@ app = FastAPI(
     openapi_url="/api/openapi.json"
 )
 
+# Setup global exception handlers
+setup_exception_handlers(app)
+
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
@@ -75,6 +87,9 @@ app.add_middleware(
 
 # Add rate limiting middleware
 app.add_middleware(RateLimitMiddleware)
+
+# Add security headers middleware
+app.add_middleware(SecurityHeadersMiddleware)
 
 # Include routers
 app.include_router(health.router, prefix=f"{settings.API_PREFIX}/health", tags=["Health"])

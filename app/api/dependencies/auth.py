@@ -1,19 +1,80 @@
 """
 Authentication dependencies
 """
-from fastapi import Depends, HTTPException, status, Header
+from fastapi import Depends, HTTPException, status, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
+import time
+import logging
 
 from app.core.async_database import get_db
-from app.core.security import decode_token, verify_api_key
+from app.core.security import decode_token, verify_api_key, is_token_blacklisted
 from app.db.models.user import User
 from app.db.models.enums import UserRole
 from app.db.utils.user_crud import user_crud
+from app.core.config import settings
 
-
+logger = logging.getLogger(__name__)
 security = HTTPBearer()
+
+
+def rate_limit_endpoint(max_requests: int = 5, window_seconds: int = 60):
+    """
+    Dependency factory for per-endpoint rate limiting.
+
+    Use this on sensitive endpoints like login, registration, password reset.
+
+    Args:
+        max_requests: Maximum requests allowed in the window
+        window_seconds: Time window in seconds
+
+    Example:
+        @router.post("/login")
+        async def login(
+            _: None = Depends(rate_limit_endpoint(max_requests=5, window_seconds=60))
+        ):
+            ...
+    """
+    async def rate_limiter(request: Request):
+        client_ip = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if not client_ip:
+            client_ip = request.headers.get("X-Real-IP", "")
+        if not client_ip and request.client:
+            client_ip = request.client.host
+
+        endpoint = request.url.path
+        current_time = int(time.time())
+        window_key = current_time // window_seconds
+        redis_key = f"endpoint_ratelimit:{endpoint}:{client_ip}:{window_key}"
+
+        try:
+            from app.core.cache import get_redis
+
+            redis = await get_redis()
+
+            pipe = redis.pipeline()
+            pipe.incr(redis_key)
+            pipe.expire(redis_key, window_seconds + 1)
+            results = await pipe.execute()
+
+            request_count = results[0]
+
+            if request_count > max_requests:
+                retry_after = window_seconds - (current_time % window_seconds)
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"Too many requests. Try again in {retry_after} seconds.",
+                    headers={"Retry-After": str(retry_after)}
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Fail open if Redis is unavailable
+            logger.warning(f"Endpoint rate limiting failed (allowing request): {e}")
+
+    return rate_limiter
 
 
 async def get_current_user(
@@ -31,9 +92,17 @@ async def get_current_user(
         User object
 
     Raises:
-        HTTPException: If token is invalid or user not found
+        HTTPException: If token is invalid, blacklisted, or user not found
     """
     token = credentials.credentials
+
+    # Check if token is blacklisted (logged out)
+    if await is_token_blacklisted(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked"
+        )
+
     payload = decode_token(token)
 
     user_id = payload.get("sub")
@@ -166,17 +235,16 @@ def require_any_role(*roles: UserRole):
             ...
     """
     async def role_checker(current_user: User = Depends(get_current_active_user)) -> User:
-        user_has_role = any([
-            await user_crud.has_role(current_user, role)
-            for role in roles
-        ])
-        if not user_has_role:
-            role_names = ", ".join([role.value for role in roles])
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Insufficient permissions. One of these roles required: {role_names}"
-            )
-        return current_user
+        # Check if user has any of the required roles
+        for role in roles:
+            if await user_crud.has_role(current_user, role):
+                return current_user
+
+        role_names = ", ".join([role.value for role in roles])
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Insufficient permissions. One of these roles required: {role_names}"
+        )
     return role_checker
 
 

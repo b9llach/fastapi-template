@@ -4,9 +4,10 @@ Authentication endpoints including 2FA
 from fastapi import APIRouter, Depends, HTTPException, status, Body, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+import secrets
 
 from app.core.async_database import get_db
-from app.api.dependencies.auth import get_current_active_user
+from app.api.dependencies.auth import get_current_active_user, rate_limit_endpoint
 from app.db.models.user import User
 from app.db.schemas.user import (
     UserCreate,
@@ -14,12 +15,14 @@ from app.db.schemas.user import (
     UserResponse,
     Token,
     UserSettings,
-    TwoFactorRequest
+    TwoFactorRequest,
+    RefreshTokenRequest
 )
 from app.services.user_service import user_service
 from app.services.email_service import email_service
 from app.db.utils.user_crud import user_crud
 from app.core.config import settings
+from app.core.cache import cache_set, cache_get, cache_delete
 
 router = APIRouter()
 
@@ -27,26 +30,43 @@ router = APIRouter()
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def register(
     user_in: UserCreate,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_endpoint(max_requests=5, window_seconds=60))
 ):
     """
     Register a new user (public endpoint)
+    Rate limited: 5 requests per minute per IP
+    Sends verification email automatically.
     """
+    from app.core.security import create_email_verification_token
+
     user = await user_service.create_user(db, user_in)
+
+    # Send verification email
+    verification_token = create_email_verification_token(user.id)
+    await email_service.send_verification_email(
+        to=user.email,
+        username=user.username,
+        verification_token=verification_token
+    )
+
     return user
 
 
 @router.post("/login")
 async def login(
     credentials: UserLogin,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_endpoint(max_requests=10, window_seconds=60))
 ):
     """
     Login endpoint - initiates 2FA if enabled for user
     Supports login with username or email
+    Rate limited: 10 requests per minute per IP
     """
     # Authenticate user credentials (supports username or email)
-    user = await user_crud.authenticate(
+    # Returns (user, error_message) tuple with brute-force protection
+    user, error_message = await user_crud.authenticate(
         db,
         credentials.username_or_email,
         credentials.password
@@ -55,7 +75,7 @@ async def login(
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username/email or password"
+            detail=error_message or "Incorrect username/email or password"
         )
 
     if not await user_crud.is_active(user):
@@ -74,14 +94,24 @@ async def login(
             code=code
         )
 
+        # Generate a temporary session token instead of exposing user_id
+        session_token = secrets.token_urlsafe(32)
+        await cache_set(
+            f"2fa_session:{session_token}",
+            str(user.id),
+            ttl=settings.TWO_FA_CODE_EXPIRE_MINUTES * 60
+        )
+
         return {
             "message": "2FA code sent to your email",
             "requires_2fa": True,
-            "user_id": user.id
+            "session_token": session_token  # Use opaque token instead of user_id
         }
     else:
         # No 2FA, return tokens directly and update last_login_at
         from datetime import datetime, timezone
+        from app.services.session_service import session_service
+
         user.last_login_at = datetime.now(timezone.utc)
         db.add(user)
         await db.commit()
@@ -91,28 +121,55 @@ async def login(
             credentials.username_or_email,
             credentials.password
         )
+
+        # Create session for tracking (non-blocking, don't fail if Redis is down)
+        try:
+            await session_service.create_session(
+                user_id=user.id,
+                token=tokens["access_token"],
+                ip_address=None,  # Will be set from request in middleware
+                user_agent=None
+            )
+        except Exception:
+            pass  # Session tracking is optional
+
         return tokens
 
 
 @router.post("/verify-2fa", response_model=Token)
 async def verify_2fa(
     request: TwoFactorRequest,
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_endpoint(max_requests=10, window_seconds=60))
 ):
     """
     Verify 2FA code and complete login
+    Rate limited: 10 requests per minute per IP
     """
-    # Verify the 2FA code
-    is_valid = await email_service.verify_2fa_code(request.user_id, request.code)
+    # Get user_id from session token
+    user_id_str = await cache_get(f"2fa_session:{request.session_token}")
+    if not user_id_str:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session. Please login again."
+        )
+
+    user_id = int(user_id_str)
+
+    # Verify the 2FA code (with brute-force protection)
+    is_valid, error_message = await email_service.verify_2fa_code(user_id, request.code)
 
     if not is_valid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired 2FA code"
+            detail=error_message or "Invalid or expired 2FA code"
         )
 
+    # Delete the session token after successful verification
+    await cache_delete(f"2fa_session:{request.session_token}")
+
     # Get user and generate tokens
-    user = await user_service.get_user_by_id(db, request.user_id)
+    user = await user_service.get_user_by_id(db, user_id)
 
     # Update last login timestamp
     from datetime import datetime, timezone
@@ -193,11 +250,19 @@ async def disable_2fa(
 ):
     """
     Disable 2FA for current user (requires password confirmation)
+    OAuth users must verify via email code instead.
     """
     if not current_user.two_fa_enabled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="2FA is not enabled"
+        )
+
+    # OAuth-only users cannot disable 2FA with password
+    if current_user.hashed_password is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth users cannot disable 2FA with password. Contact support."
         )
 
     # Verify password for security
@@ -356,4 +421,401 @@ async def google_callback(
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer"
+    }
+
+
+@router.post("/refresh", response_model=Token)
+async def refresh_access_token(
+    request: RefreshTokenRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Refresh access token using a valid refresh token
+    """
+    from app.core.security import decode_token, create_access_token, create_refresh_token
+
+    # Decode and validate refresh token (explicitly check for refresh type)
+    payload = decode_token(request.refresh_token, expected_type="refresh")
+
+    user_id = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token"
+        )
+
+    # Verify user still exists and is active
+    user = await user_crud.get(db, int(user_id))
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
+
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is inactive"
+        )
+
+    # Generate new tokens
+    new_access_token = create_access_token(
+        data={
+            "sub": str(user.id),
+            "username": user.username,
+            "role": user.role.value
+        }
+    )
+    new_refresh_token = create_refresh_token(
+        data={
+            "sub": str(user.id),
+            "username": user.username,
+            "role": user.role.value
+        }
+    )
+
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer"
+    }
+
+
+@router.post("/logout")
+async def logout(
+    current_user: User = Depends(get_current_active_user),
+    request: Request = None
+):
+    """
+    Logout user by blacklisting their current token
+
+    The token will be invalidated and cannot be used again.
+    """
+    from app.core.security import blacklist_token
+    from fastapi.security import HTTPAuthorizationCredentials
+
+    # Get the token from the Authorization header
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        await blacklist_token(token)
+
+    return {"message": "Successfully logged out"}
+
+
+@router.post("/request-password-reset")
+async def request_password_reset(
+    email: str = Body(..., embed=True),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_endpoint(max_requests=3, window_seconds=60))
+):
+    """
+    Request a password reset email
+
+    Always returns success to prevent email enumeration.
+    Rate limited: 3 requests per minute per IP
+    """
+    from app.core.security import create_password_reset_token
+
+    user = await user_crud.get_by_email(db, email)
+
+    if user and user.hashed_password is not None:
+        # Only send reset email if user exists and has a password
+        # (OAuth-only users can't reset password)
+        reset_token = create_password_reset_token(user.id)
+        await email_service.send_password_reset_email(user.email, reset_token)
+
+    # Always return success to prevent email enumeration
+    return {
+        "message": "If an account exists with that email, a password reset link has been sent."
+    }
+
+
+@router.post("/reset-password")
+async def reset_password(
+    token: str = Body(...),
+    new_password: str = Body(...),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(rate_limit_endpoint(max_requests=5, window_seconds=60))
+):
+    """
+    Reset password using a valid reset token
+    Rate limited: 5 requests per minute per IP
+    """
+    from app.core.security import decode_password_reset_token, hash_password
+    from app.utils.validators import validate_password_strength
+
+    # Validate password strength
+    is_valid, error_message = validate_password_strength(new_password)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_message
+        )
+
+    # Decode and validate token
+    user_id = decode_password_reset_token(token)
+
+    # Get user
+    user = await user_crud.get(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid reset token"
+        )
+
+    # OAuth-only users cannot set password this way
+    if user.oauth_provider and user.hashed_password is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth users cannot reset password. Please login with your OAuth provider."
+        )
+
+    # Update password
+    user.hashed_password = hash_password(new_password)
+    db.add(user)
+    await db.commit()
+
+    # Send confirmation email
+    await email_service.send_email(
+        to=[user.email],
+        subject="Password Changed",
+        body="Your password has been successfully changed. If you didn't do this, contact support immediately.",
+        html="<p>Your password has been successfully changed.</p><p>If you didn't do this, contact support immediately.</p>"
+    )
+
+    return {"message": "Password has been reset successfully"}
+
+
+@router.get("/verify-email")
+async def verify_email(
+    token: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Verify email address using the token sent to user's email
+    """
+    from app.core.security import decode_email_verification_token
+
+    user_id = decode_email_verification_token(token)
+
+    user = await user_crud.get(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid verification token"
+        )
+
+    if user.email_verified:
+        return {"message": "Email already verified"}
+
+    user.email_verified = True
+    db.add(user)
+    await db.commit()
+
+    return {"message": "Email verified successfully"}
+
+
+@router.post("/resend-verification")
+async def resend_verification_email(
+    current_user: User = Depends(get_current_active_user),
+    _: None = Depends(rate_limit_endpoint(max_requests=3, window_seconds=60))
+):
+    """
+    Resend email verification link
+    Rate limited: 3 requests per minute
+    """
+    from app.core.security import create_email_verification_token
+
+    if current_user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already verified"
+        )
+
+    verification_token = create_email_verification_token(current_user.id)
+    await email_service.send_verification_email(
+        to=current_user.email,
+        username=current_user.username,
+        verification_token=verification_token
+    )
+
+    return {"message": "Verification email sent"}
+
+
+@router.post("/change-password")
+async def change_password(
+    current_password: str = Body(...),
+    new_password: str = Body(...),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Change password for authenticated user
+    Requires current password for verification
+    """
+    from app.core.security import verify_password, hash_password
+    from app.utils.validators import validate_password_strength
+
+    # OAuth-only users cannot change password
+    if current_user.hashed_password is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth users cannot change password"
+        )
+
+    # Verify current password
+    if not verify_password(current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Current password is incorrect"
+        )
+
+    # Validate new password strength
+    is_valid, error_message = validate_password_strength(new_password)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_message
+        )
+
+    # Ensure new password is different
+    if verify_password(new_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from current password"
+        )
+
+    # Update password
+    current_user.hashed_password = hash_password(new_password)
+    db.add(current_user)
+    await db.commit()
+
+    # Send notification email
+    await email_service.send_email(
+        to=[current_user.email],
+        subject="Password Changed",
+        body="Your password has been successfully changed. If you didn't do this, contact support immediately.",
+        html="<p>Your password has been successfully changed.</p><p>If you didn't do this, contact support immediately.</p>"
+    )
+
+    return {"message": "Password changed successfully"}
+
+
+@router.delete("/delete-account")
+async def delete_account(
+    password: str = Body(..., embed=True),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Delete current user's account (GDPR compliance)
+    Requires password confirmation for security.
+    OAuth users must confirm with 'DELETE' string instead.
+    """
+    from app.core.security import verify_password
+
+    # For OAuth users, require typing 'DELETE' as confirmation
+    if current_user.hashed_password is None:
+        if password != "DELETE":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="OAuth users must type 'DELETE' to confirm account deletion"
+            )
+    else:
+        # Verify password for regular users
+        if not verify_password(password, current_user.hashed_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect password"
+            )
+
+    # Store email for confirmation before deletion
+    user_email = current_user.email
+    user_username = current_user.username
+
+    # Delete the user
+    await db.delete(current_user)
+    await db.commit()
+
+    # Send confirmation email
+    await email_service.send_email(
+        to=[user_email],
+        subject="Account Deleted",
+        body=f"Your account ({user_username}) has been permanently deleted. We're sorry to see you go.",
+        html=f"<p>Your account ({user_username}) has been permanently deleted.</p><p>We're sorry to see you go.</p>"
+    )
+
+    return {"message": "Account deleted successfully"}
+
+
+# Session management endpoints
+@router.get("/sessions")
+async def list_sessions(
+    request: Request,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    List all active sessions for the current user
+    """
+    from app.services.session_service import session_service
+
+    # Get current token to mark current session
+    auth_header = request.headers.get("Authorization", "")
+    current_token = auth_header[7:] if auth_header.startswith("Bearer ") else None
+
+    sessions = await session_service.get_user_sessions(
+        current_user.id,
+        current_token=current_token
+    )
+
+    return {
+        "sessions": [s.to_dict() for s in sessions],
+        "total": len(sessions)
+    }
+
+
+@router.delete("/sessions/{session_id}")
+async def revoke_session(
+    session_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Revoke a specific session
+    """
+    from app.services.session_service import session_service
+
+    success = await session_service.revoke_session(current_user.id, session_id)
+
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found"
+        )
+
+    return {"message": "Session revoked successfully"}
+
+
+@router.delete("/sessions")
+async def revoke_all_sessions(
+    request: Request,
+    current_user: User = Depends(get_current_active_user)
+):
+    """
+    Revoke all sessions except the current one
+    """
+    from app.services.session_service import session_service
+
+    # Get current token to keep current session
+    auth_header = request.headers.get("Authorization", "")
+    current_token = auth_header[7:] if auth_header.startswith("Bearer ") else None
+
+    revoked_count = await session_service.revoke_all_sessions(
+        current_user.id,
+        except_current=current_token
+    )
+
+    return {
+        "message": f"Revoked {revoked_count} session(s)",
+        "revoked_count": revoked_count
     }

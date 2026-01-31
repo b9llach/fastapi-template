@@ -26,9 +26,9 @@ class UserBase(BaseModel):
 class UserCreate(UserBase):
     """
     Schema for creating a new user
+    Note: role is not exposed here - users are always created with USER role
     """
     password: str = Field(..., min_length=8, max_length=100)
-    role: Optional[UserRole] = UserRole.USER
 
 
 class UserUpdate(BaseModel):
@@ -82,8 +82,15 @@ class TwoFactorRequest(BaseModel):
     """
     Schema for 2FA verification request
     """
-    user_id: int
+    session_token: str = Field(..., description="Temporary session token from login response")
     code: str = Field(..., min_length=6, max_length=6)
+
+
+class RefreshTokenRequest(BaseModel):
+    """
+    Schema for refresh token request
+    """
+    refresh_token: str
 
 
 class UserLogin(BaseModel):

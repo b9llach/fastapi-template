@@ -247,28 +247,52 @@ The {settings.PROJECT_NAME} Team
         logger.info(f"2FA code generated for user {user_id}")
         return code
 
-    async def verify_2fa_code(self, user_id: int, code: str) -> bool:
+    async def verify_2fa_code(self, user_id: int, code: str) -> tuple[bool, str]:
         """
-        Verify 2FA code
+        Verify 2FA code with brute-force protection
 
         Args:
             user_id: User ID
             code: Code to verify
 
         Returns:
-            True if code is valid
+            Tuple of (is_valid, error_message)
+            - (True, "") if code is valid
+            - (False, error_message) if invalid or locked out
         """
+        max_attempts = settings.TWO_FA_MAX_ATTEMPTS
+        lockout_minutes = settings.TWO_FA_LOCKOUT_MINUTES
+
+        attempts_key = f"2fa_attempts:{user_id}"
         cache_key = f"2fa:{user_id}"
+
+        # Check if user is locked out
+        attempts = await cache_get(attempts_key)
+        if attempts and int(attempts) >= max_attempts:
+            logger.warning(f"2FA locked out for user {user_id}")
+            return False, f"Too many failed attempts. Try again in {lockout_minutes} minutes."
+
         stored_code = await cache_get(cache_key)
 
         if stored_code and stored_code == code:
-            # Delete the code after successful verification
+            # Delete the code and reset attempts after successful verification
             await cache_delete(cache_key)
+            await cache_delete(attempts_key)
             logger.info(f"2FA code verified for user {user_id}")
-            return True
+            return True, ""
 
-        logger.warning(f"Invalid 2FA code attempt for user {user_id}")
-        return False
+        # Increment failed attempts
+        current_attempts = int(attempts) if attempts else 0
+        new_attempts = current_attempts + 1
+        await cache_set(attempts_key, str(new_attempts), ttl=lockout_minutes * 60)
+
+        remaining = max_attempts - new_attempts
+        logger.warning(f"Invalid 2FA code attempt for user {user_id}. {remaining} attempts remaining.")
+
+        if remaining <= 0:
+            return False, f"Too many failed attempts. Try again in {lockout_minutes} minutes."
+
+        return False, f"Invalid code. {remaining} attempts remaining."
 
     async def send_2fa_email(
         self,

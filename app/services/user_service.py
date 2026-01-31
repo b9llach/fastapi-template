@@ -10,6 +10,7 @@ from app.db.models.enums import UserRole
 from app.db.schemas.user import UserCreate, UserUpdate, UserResponse
 from app.db.utils.user_crud import user_crud
 from app.core.security import create_access_token, create_refresh_token
+from app.utils.validators import validate_password_strength
 
 
 class UserService:
@@ -33,8 +34,16 @@ class UserService:
             Created user
 
         Raises:
-            HTTPException: If username or email already exists
+            HTTPException: If username or email already exists, or password is weak
         """
+        # Validate password strength
+        is_valid, error_message = validate_password_strength(user_in.password)
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=error_message
+            )
+
         # Check if username exists
         existing_user = await user_crud.get_by_username(db, user_in.username)
         if existing_user:
@@ -76,11 +85,11 @@ class UserService:
         Raises:
             HTTPException: If authentication fails
         """
-        user = await user_crud.authenticate(db, username_or_email, password)
+        user, error_message = await user_crud.authenticate(db, username_or_email, password)
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username/email or password"
+                detail=error_message or "Incorrect username/email or password"
             )
 
         if not await user_crud.is_active(user):

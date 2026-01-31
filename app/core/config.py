@@ -43,6 +43,7 @@ class Settings(BaseSettings):
 
     # API Keys
     API_KEY_HEADER: str = "X-API-Key"
+    API_KEYS: List[str] = []  # Configure valid API keys in .env as comma-separated list
 
     # Email / SMTP Configuration
     SMTP_TLS: bool = True
@@ -55,6 +56,12 @@ class Settings(BaseSettings):
 
     # 2FA Settings
     TWO_FA_CODE_EXPIRE_MINUTES: int = 10
+    TWO_FA_MAX_ATTEMPTS: int = 5
+    TWO_FA_LOCKOUT_MINUTES: int = 15
+
+    # Login Brute-Force Protection
+    LOGIN_MAX_ATTEMPTS: int = 5
+    LOGIN_LOCKOUT_MINUTES: int = 15
 
     # Google OAuth Settings
     GOOGLE_CLIENT_ID: str = ""
